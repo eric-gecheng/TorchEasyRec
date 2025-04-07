@@ -26,3 +26,9 @@ message MultiTowerDINTRT {
     repeated DINTower din_towers = 2;
     required MLP final = 3;
 }
+
+message SemanticCross {
+    required MLP mlp = 1;
+    required uint32 query_embeddings_cnt = 2;
+    required uint32 item_embeddings_cnt = 3;
+}

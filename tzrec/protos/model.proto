@@ -57,6 +57,8 @@ message ModelConfig {
         MultiTowerDINTRT multi_tower_din_trt =500;
 
         RocketLaunching rocket_launching = 600;
+
+        SemanticCross semantic_cross = 700;
     }
 
     optional uint32 num_class = 2 [default = 1];
