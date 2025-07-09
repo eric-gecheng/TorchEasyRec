@@ -36,7 +36,10 @@ from tzrec.features.feature import BaseFeature
 from tzrec.modules.dense_embedding_collection import (
     DenseEmbeddingCollection,
 )
-from tzrec.modules.mock_embedding_bag_collection import MockEmbeddingBagCollection
+from tzrec.modules.mock_embedding import (
+    MockEmbeddingBagCollection,
+    MockEmbeddingCollection,
+)
 from tzrec.modules.sequence import create_seq_encoder
 from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
@@ -834,12 +837,14 @@ class SequenceEmbeddingGroup(nn.Module):
         features: List[BaseFeature],
         feature_groups: List[FeatureGroupConfig],
         device: Optional[torch.device] = None,
+        is_mock: Optional[bool] = False,
     ) -> None:
         super().__init__()
         if device is None:
             device = torch.device("meta")
         self._features = features
         self._feature_groups = feature_groups
+        self._device = device
         self._name_to_feature = {x.name: x for x in features}
         self._name_to_feature_group = {x.group_name: x for x in feature_groups}
 
@@ -869,7 +874,7 @@ class SequenceEmbeddingGroup(nn.Module):
 
         for k, v in self._impl_key_to_seq_groups.items():
             self.seq_emb_impls[k] = SequenceEmbeddingGroupImpl(
-                features, feature_groups=v, device=device
+                features, feature_groups=v, device=device, is_mock=is_mock
             )
 
     def group_names(self) -> List[str]:
@@ -1037,6 +1042,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         features: List[BaseFeature],
         feature_groups: List[Union[FeatureGroupConfig, SeqGroupConfig]],
         device: Optional[torch.device] = None,
+        is_mock: Optional[bool] = False,
     ) -> None:
         super().__init__()
         if device is None:
@@ -1197,6 +1203,8 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         for _, emb_configs in dim_to_emb_configs.items():
             self.ec_list.append(
                 EmbeddingCollection(list(emb_configs.values()), device=device)
+                if not is_mock
+                else MockEmbeddingCollection(list(emb_configs.values()), device=device)
             )
 
         self.mc_ec_list = nn.ModuleList()

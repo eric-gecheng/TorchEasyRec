@@ -9,21 +9,89 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
-from torchrec.modules.embedding_configs import (
-    EmbeddingBagConfig,
-)
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollectionInterface,
+    EmbeddingCollectionInterface,
     get_embedding_names_by_table,
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 
 @torch.fx.wrap
-def get_zeros(f: JaggedTensor, dim: int):
+def get_zeros_collection(f: JaggedTensor, dim: int):
+    """Get zeros tensor."""
+    n_samples = len(f.values())
+    return torch.zeros((n_samples, dim), dtype=torch.float, device="cpu")
+
+
+class MockEmbeddingCollection(EmbeddingCollectionInterface):
+    """mock embedding collection."""
+
+    def __init__(
+        self,
+        tables: List[EmbeddingConfig],
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        torch._C._log_api_usage_once(f"torchrec.modules.{self.__class__.__name__}")
+        self._embedding_configs = tables
+        self._device: torch.device = (
+            device if device is not None else torch.device("cpu")
+        )
+
+        self._embedding_names_by_table: List[List[str]] = get_embedding_names_by_table(
+            tables
+        )
+        self._feature_names: List[List[str]] = [table.feature_names for table in tables]
+
+    def forward(
+        self,
+        features: KeyedJaggedTensor,
+    ) -> Dict[str, JaggedTensor]:
+        """Forward pass."""
+        feature_embeddings: Dict[str, JaggedTensor] = {}
+        jt_dict: Dict[str, JaggedTensor] = features.to_dict()
+        for i, emb_config in enumerate(self._embedding_configs):
+            feature_names = self._feature_names[i]
+            embedding_names = self._embedding_names_by_table[i]
+            for j, embedding_name in enumerate(embedding_names):
+                feature_name = feature_names[j]
+                f = jt_dict[feature_name]
+                dim = emb_config.embedding_dim
+                lookup = get_zeros_collection(f, dim)
+                feature_embeddings[embedding_name] = JaggedTensor(
+                    values=lookup, lengths=f.lengths()
+                )
+        return feature_embeddings
+
+    def need_indices(self) -> bool:
+        """Override."""
+        pass
+
+    def embedding_dim(self) -> int:
+        """Override."""
+        pass
+
+    def embedding_configs(self) -> List[EmbeddingConfig]:
+        """Returns: List[EmbeddingConfig]: The embedding configs."""
+        return self._embedding_configs
+
+    def embedding_names_by_table(self) -> List[List[str]]:
+        """Returns: List[List[str]]: The embedding names by table."""
+        return self._embedding_names_by_table
+
+    @property
+    def device(self) -> torch.device:
+        """Returns: torch.device: The compute device."""
+        return self._device
+
+
+@torch.fx.wrap
+def get_zeros_bag(f: JaggedTensor, dim: int):
     """Get zeros tensor."""
     n_samples = len(f.offsets())
     return torch.zeros((n_samples, dim), dtype=torch.float, device="cpu")
@@ -76,7 +144,7 @@ class MockEmbeddingBagCollection(EmbeddingBagCollectionInterface):
             dim = self._lengths_per_embedding[i]
             name = self._feature_names[i][0]
             f = features_dict[name]
-            pooled_emb.append(get_zeros(f, dim))
+            pooled_emb.append(get_zeros_bag(f, dim))
 
         pooled_emb = torch.cat(pooled_emb, dim=1)
 

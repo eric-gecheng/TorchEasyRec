@@ -68,7 +68,11 @@ from tzrec.models.match_model import (
 )
 from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
-from tzrec.modules.embedding import EmbeddingGroup, EmbeddingWrapper
+from tzrec.modules.embedding import (
+    EmbeddingGroup,
+    EmbeddingWrapper,
+    SequenceEmbeddingGroup,
+)
 from tzrec.modules.utils import BaseModule
 from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
@@ -1088,7 +1092,17 @@ def export(
                         is_mock=True,
                     ),
                 )
-                break
+            if isinstance(module, SequenceEmbeddingGroup):
+                setattr(
+                    model.model,
+                    name,
+                    SequenceEmbeddingGroup(
+                        module._features,
+                        module._feature_groups,
+                        module._device,
+                        is_mock=True,
+                    ),
+                )
         _script_model(
             ori_pipeline_config,
             model,
