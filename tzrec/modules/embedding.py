@@ -36,6 +36,7 @@ from tzrec.features.feature import BaseFeature
 from tzrec.modules.dense_embedding_collection import (
     DenseEmbeddingCollection,
 )
+from tzrec.modules.mock_embedding_bag_collection import MockEmbeddingBagCollection
 from tzrec.modules.sequence import create_seq_encoder
 from tzrec.protos import model_pb2
 from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
@@ -139,12 +140,15 @@ class EmbeddingGroup(nn.Module):
         feature_groups: List[FeatureGroupConfig],
         wide_embedding_dim: Optional[int] = None,
         device: Optional[torch.device] = None,
+        is_mock: Optional[bool] = False,
     ) -> None:
         super().__init__()
         if device is None:
             device = torch.device("meta")
         self._features = features
         self._feature_groups = feature_groups
+        self._wide_embedding_dim = wide_embedding_dim
+        self._device = device
         self._name_to_feature = {x.name: x for x in features}
         self._name_to_feature_group = {x.group_name: x for x in feature_groups}
 
@@ -202,6 +206,7 @@ class EmbeddingGroup(nn.Module):
                 feature_groups=v,
                 wide_embedding_dim=wide_embedding_dim,
                 device=device,
+                is_mock=is_mock,
             )
 
         for k, v in self._impl_key_to_seq_groups.items():
@@ -568,6 +573,7 @@ class EmbeddingGroupImpl(nn.Module):
         feature_groups: List[FeatureGroupConfig],
         wide_embedding_dim: Optional[int] = None,
         device: Optional[torch.device] = None,
+        is_mock: Optional[bool] = False,
     ) -> None:
         super().__init__()
         if device is None:
@@ -700,7 +706,14 @@ class EmbeddingGroupImpl(nn.Module):
             self._group_total_dim[group_name] = total_dim
             self._group_feature_output_dims[group_name] = feature_output_dims
 
-        self.ebc = EmbeddingBagCollection(list(emb_bag_configs.values()), device=device)
+        if not is_mock:
+            self.ebc = EmbeddingBagCollection(
+                list(emb_bag_configs.values()), device=device
+            )
+        else:
+            self.ebc = MockEmbeddingBagCollection(
+                list(emb_bag_configs.values()), device=device
+            )
         if self.has_mc_sparse:
             self.mc_ebc = ManagedCollisionEmbeddingBagCollection(
                 EmbeddingBagCollection(
@@ -1460,3 +1473,27 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             results[group_name] = group_result
 
         return results
+
+
+class EmbeddingWrapper(nn.Module):
+    """Embedding inference wrapper for jit.script."""
+
+    def __init__(
+        self, module: EmbeddingGroup, embedding_group_name: str = "embedding_group"
+    ) -> None:
+        super().__init__()
+        self._embedding_group_name = embedding_group_name
+        self._features = module._features
+        setattr(self, embedding_group_name, module)
+
+    def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
+        """Forward the embedding.
+
+        Args:
+            batch (Batch): input batch data.
+
+        Return:
+            embedding (dict): embedding group output.
+        """
+        result = getattr(self, self._embedding_group_name)(batch)
+        return result
