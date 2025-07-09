@@ -68,7 +68,7 @@ from tzrec.models.match_model import (
 )
 from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, TrainWrapper
 from tzrec.models.tdm import TDM, TDMEmbedding
-from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.modules.embedding import EmbeddingGroup, EmbeddingWrapper
 from tzrec.modules.utils import BaseModule
 from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
@@ -938,6 +938,7 @@ def export(
     export_dir: str,
     checkpoint_path: Optional[str] = None,
     asset_files: Optional[str] = None,
+    split_sparse_embedding: Optional[bool] = False,
 ) -> None:
     """Export a EasyRec model.
 
@@ -947,6 +948,9 @@ def export(
         checkpoint_path (str, optional): if specified, will use this model instead of
             model specified by model_dir in pipeline_config_path.
         asset_files (str, optional): more files will be copied to export_dir.
+        split_sparse_embedding (bool, optional): if true, will split the sparse
+            embedding parameters and other dense parameters, and export them
+            separately. Default: false
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     if not is_rank_zero:
@@ -1058,6 +1062,43 @@ def export(
         )
         for asset in assets:
             shutil.copy(asset, os.path.join(export_dir, "model"))
+    elif split_sparse_embedding:
+        for name, module in model.model.named_children():
+            if isinstance(module, EmbeddingGroup):  # export sparse parameters
+                emb_module = InferWrapper(EmbeddingWrapper(module, name))
+                _script_model(
+                    ori_pipeline_config,
+                    emb_module,
+                    model.state_dict(),
+                    dataloader,
+                    os.path.join(export_dir, "sparse"),
+                )
+                break
+
+        for name, module in model.model.named_children():
+            if isinstance(module, EmbeddingGroup):  # replace the sparse parameters
+                setattr(
+                    model.model,
+                    name,
+                    EmbeddingGroup(
+                        module._features,
+                        module._feature_groups,
+                        module._wide_embedding_dim,
+                        module._device,
+                        is_mock=True,
+                    ),
+                )
+                break
+        _script_model(
+            ori_pipeline_config,
+            model,
+            None,
+            dataloader,
+            os.path.join(export_dir, "dense"),
+        )
+
+        for asset in assets:
+            shutil.copy(asset, export_dir)
     else:
         _script_model(
             ori_pipeline_config,
