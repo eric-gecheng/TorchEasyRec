@@ -40,6 +40,13 @@ if __name__ == "__main__":
         default=None,
         help="more files will be copied to export_dir.",
     )
+    parser.add_argument(
+        "--split_sparse_embedding",
+        type=bool,
+        default=False,
+        help="save sparse embeddings and dense parameters separately.",
+    )
+
     args, extra_args = parser.parse_known_args()
 
     export(
@@ -47,4 +54,5 @@ if __name__ == "__main__":
         export_dir=args.export_dir,
         checkpoint_path=args.checkpoint_path,
         asset_files=args.asset_files,
+        split_sparse_embedding=args.split_sparse_embedding,
     )
