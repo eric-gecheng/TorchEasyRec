@@ -165,6 +165,7 @@ class MLPEmbedding(nn.Module):
         self,
         num_dense_feature: int,
         embedding_dim: int,
+        features: list,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
@@ -186,6 +187,9 @@ class MLPEmbedding(nn.Module):
             output (Tensor): Tensor of mlp embedding, shape = [b, n * d],
                 where d is the embedding_dim.
         """
+        print(
+            f"{self.proj_w.shape}-----------------------------------------------------"
+        )
         return torch.einsum("ni,bn->bni", self.proj_w, input).reshape(
             (-1, self.num_dense_feature * self.embedding_dim)
         )

@@ -132,8 +132,8 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
         """Get an iterator over sparse parameters of the module."""
         q = Queue()
         q.put(self)
-        trainable_parameters_list = []
-        frozen_parameters_list = []
+        trainable_parameters_dict = dict()
+        frozen_parameters_dict = dict()
         while not q.empty():
             m = q.get()
             if isinstance(m, EmbeddingBagCollectionInterface):
@@ -145,9 +145,9 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
                 for name, param in m.named_parameters():
                     frozen = any(map(lambda x: name.endswith(x), frozen_names))
                     if frozen:
-                        frozen_parameters_list.append(param)
+                        frozen_parameters_dict[name] = param
                     else:
-                        trainable_parameters_list.append(param)
+                        trainable_parameters_dict[name] = param
             elif isinstance(m, EmbeddingCollectionInterface):
                 frozen_names = {
                     f".{t.name}.weight"
@@ -157,13 +157,13 @@ class BaseModel(BaseModule, metaclass=_meta_cls):
                 for name, param in m.named_parameters():
                     frozen = any(map(lambda x: name.endswith(x), frozen_names))
                     if frozen:
-                        frozen_parameters_list.append(param)
+                        frozen_parameters_dict[name] = param
                     else:
-                        trainable_parameters_list.append(param)
+                        trainable_parameters_dict[name] = param
             else:
                 for child in m.children():
                     q.put(child)
-        return trainable_parameters_list, frozen_parameters_list
+        return trainable_parameters_dict, frozen_parameters_dict
 
     def forward(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Predict the model."""

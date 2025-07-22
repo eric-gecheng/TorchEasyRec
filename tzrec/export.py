@@ -42,9 +42,16 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--split_sparse_embedding",
-        type=bool,
+        action="store_true",
         default=False,
         help="save sparse embeddings and dense parameters separately.",
+    )
+    parser.add_argument(
+        "--export_sparse_delta",
+        action="store_true",
+        default=False,
+        help="save modified row indices of embedding table after train, only be used \
+            when split_sparse_embedding=True",
     )
 
     args, extra_args = parser.parse_known_args()
@@ -55,4 +62,5 @@ if __name__ == "__main__":
         checkpoint_path=args.checkpoint_path,
         asset_files=args.asset_files,
         split_sparse_embedding=args.split_sparse_embedding,
+        export_sparse_delta=args.export_sparse_delta,
     )

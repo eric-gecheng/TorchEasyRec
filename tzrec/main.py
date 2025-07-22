@@ -13,12 +13,14 @@ import copy
 import itertools
 import json
 import os
+import pickle
 import shutil
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from queue import Queue
 from threading import Thread
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
+import numpy as np
 import pyarrow as pa
 import torch
 from torch import distributed as dist
@@ -70,7 +72,6 @@ from tzrec.models.model import BaseModel, CudaExportWrapper, ScriptWrapper, Trai
 from tzrec.models.tdm import TDM, TDMEmbedding
 from tzrec.modules.embedding import (
     EmbeddingGroup,
-    EmbeddingWrapper,
     SequenceEmbeddingGroup,
 )
 from tzrec.modules.utils import BaseModule
@@ -417,6 +418,7 @@ def _train_and_evaluate(
     skip_steps: int = -1,
     ckpt_path: Optional[str] = None,
     eval_result_filename: str = "train_eval_result.txt",
+    log_sparse_feature: Optional[bool] = False,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -481,6 +483,7 @@ def _train_and_evaluate(
     i_step = 0
     i_epoch = 0
     losses = {}
+    sparse_collector: Dict[str, Set[int]] = defaultdict(set)
     for i_epoch in epoch_iter:
         pipeline = TrainPipelineSparseDist(
             model, optimizer, model.device, execute_all_batches=True
@@ -504,7 +507,13 @@ def _train_and_evaluate(
             if i_step <= skip_steps:
                 continue
             try:
-                losses, _, _ = pipeline.progress(train_iterator)
+                losses, _, batch = pipeline.progress(train_iterator)
+                if log_sparse_feature and i_epoch == 0:
+                    from tzrec.utils.sparse_feature_log import sparse_feature_collect
+
+                    sparse_feature_collect(
+                        batch.sparse_features["__BASE__"], sparse_collector
+                    )
 
                 if i_step % train_config.log_step_count_steps == 0:
                     _log_train(
@@ -546,6 +555,10 @@ def _train_and_evaluate(
                         model.train()
             if train_config.is_profiling:
                 prof.step()
+
+        if log_sparse_feature and i_epoch == 0:
+            with open(os.path.join(model_dir, "sparse_collector.pkl"), "wb") as handle:
+                pickle.dump(sparse_collector, handle)
 
         if save_checkpoints_epochs > 0 and i_step > 0:
             if i_epoch % save_checkpoints_epochs == 0:
@@ -614,6 +627,7 @@ def train_and_evaluate(
     continue_train: Optional[bool] = True,
     fine_tune_checkpoint: Optional[str] = None,
     edit_config_json: Optional[str] = None,
+    log_sparse_feature: Optional[bool] = False,
 ) -> None:
     """Train and evaluate a EasyRec model.
 
@@ -627,6 +641,10 @@ def train_and_evaluate(
         fine_tune_checkpoint (str, optional): path to an existing
             finetune checkpoint.
         edit_config_json (str, optional): edit pipeline config json str.
+        log_sparse_feature (bool, optional): whether to log the sparse
+            feature hash index, default False. This parameter is used for
+            marking which part of embedding table is updated during
+            training, so as to save embedding table incrementally.
     """
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     if fine_tune_checkpoint:
@@ -710,10 +728,12 @@ def train_and_evaluate(
         pipeline_config.train_config.sparse_optimizer
     )
     trainable_params, frozen_params = model.model.sparse_parameters()
-    apply_optimizer_in_backward(sparse_optim_cls, trainable_params, sparse_optim_kwargs)
+    apply_optimizer_in_backward(
+        sparse_optim_cls, list(trainable_params.values()), sparse_optim_kwargs
+    )
     if len(frozen_params) > 0:
         # SGD and lr=0 for using fused kernel and freezing params
-        apply_optimizer_in_backward(SGD, frozen_params, {"lr": 0.0})
+        apply_optimizer_in_backward(SGD, list(frozen_params.values()), {"lr": 0.0})
 
     planner = create_planner(
         device=device,
@@ -773,6 +793,7 @@ def train_and_evaluate(
         eval_config=pipeline_config.eval_config,
         skip_steps=skip_steps,
         ckpt_path=ckpt_path,
+        log_sparse_feature=log_sparse_feature,
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
@@ -943,6 +964,7 @@ def export(
     checkpoint_path: Optional[str] = None,
     asset_files: Optional[str] = None,
     split_sparse_embedding: Optional[bool] = False,
+    export_sparse_delta: Optional[bool] = False,
 ) -> None:
     """Export a EasyRec model.
 
@@ -955,6 +977,8 @@ def export(
         split_sparse_embedding (bool, optional): if true, will split the sparse
             embedding parameters and other dense parameters, and export them
             separately. Default: false
+        export_sparse_delta (bool, optional): if true, only export the updated rows of
+            the embedding parameters. Default: false
     """
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     if not is_rank_zero:
@@ -1039,7 +1063,7 @@ def export(
                 _script_model(
                     ori_pipeline_config,
                     tower,
-                    model.state_dict(),
+                    None,  # model.state_dict(),
                     dataloader,
                     tower_export_dir,
                 )
@@ -1067,17 +1091,25 @@ def export(
         for asset in assets:
             shutil.copy(asset, os.path.join(export_dir, "model"))
     elif split_sparse_embedding:
-        for name, module in model.model.named_children():
-            if isinstance(module, EmbeddingGroup):  # export sparse parameters
-                emb_module = InferWrapper(EmbeddingWrapper(module, name))
-                _script_model(
-                    ori_pipeline_config,
-                    emb_module,
-                    model.state_dict(),
-                    dataloader,
-                    os.path.join(export_dir, "sparse"),
-                )
-                break
+        trainable_dict, frozen_dict = model.model.sparse_parameters()
+        sparse_export_path = os.path.join(export_dir, "sparse")
+        if not os.path.exists(sparse_export_path):
+            os.makedirs(sparse_export_path)
+        if export_sparse_delta:
+            with open(f"{export_dir}/../sparse_collector.pkl", "rb") as f:
+                sparse_collector = pickle.load(f)
+        for name, tensor in trainable_dict.items():
+            name = ".".join(name.split(".")[1:-1])
+            if not export_sparse_delta:
+                np.save(f"{sparse_export_path}/{name}", tensor.detach().numpy())
+            else:
+                indices_set = list(sparse_collector[name])
+                tensor_subset = tensor[indices_set, :]
+                np.save(f"{sparse_export_path}/{name}", tensor_subset.detach().numpy())
+
+        for name, tensor in frozen_dict.items():
+            name = ".".join(name.split(".")[1:-1])
+            np.save(f"{sparse_export_path}/{name}", tensor.detach().numpy())
 
         for name, module in model.model.named_children():
             if isinstance(module, EmbeddingGroup):  # replace the sparse parameters
