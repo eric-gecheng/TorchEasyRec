@@ -602,6 +602,36 @@ class DataParser:
             dg_has_weight_keys = self.has_weight_keys[dg]
             dg_sequence_mulval_sparse_keys = self.sequence_mulval_sparse_keys[dg]
 
+            keys_user_feats = [key for key in keys if key in self.user_feats]
+            keys_other = [key for key in keys if key not in self.user_feats]
+
+            user_values, user_lengths, user_weights = [], [], []
+            for key in keys_user_feats:
+                value = input_data[f"{key}.values"]
+                length = input_data[f"{key}.lengths"]
+                user_values.append(value)
+                user_lengths.append(length)
+                if len(dg_has_weight_keys) > 0:
+                    if key in dg_has_weight_keys:
+                        weight = input_data[f"{key}.weights"]
+                    else:
+                        weight = torch.ones_like(
+                            input_data[f"{key}.values"], dtype=torch.float32
+                        )
+                    user_weights.append(weight)
+
+            user_values_tiled = (
+                torch.cat(user_values).unsqueeze(-1).tile(tile_size).flatten()
+            )
+            user_lengths_tiled = (
+                torch.cat(user_lengths).unsqueeze(-1).tile(tile_size).flatten()
+            )
+            if len(user_weights) > 0:
+                user_weights_tiled = (
+                    torch.cat(user_weights).unsqueeze(-1).tile(tile_size).flatten()
+                )
+
+            keys = keys_user_feats + keys_other
             for key in keys:
                 value = input_data[f"{key}.values"]
                 length = input_data[f"{key}.lengths"]
@@ -620,14 +650,9 @@ class DataParser:
                     mulval_keys.append(key)
                     mulval_seq_lengths.append(seq_length)
                     mulval_key_lengths.append(key_length)
-                if key in self.user_feats:
-                    # pyre-ignore [6]
-                    value = value.tile(tile_size)
-                    # pyre-ignore [6]
-                    length = length.tile(tile_size)
-
-                values.append(value)
-                lengths.append(length)
+                if key not in self.user_feats:
+                    values.append(value)
+                    lengths.append(length)
 
                 if len(dg_has_weight_keys) > 0:
                     if key in dg_has_weight_keys:
@@ -636,20 +661,35 @@ class DataParser:
                         weight = torch.ones_like(
                             input_data[f"{key}.values"], dtype=torch.float32
                         )
-                    if key in self.user_feats:
-                        # pyre-ignore [6]
-                        weight = weight.tile(tile_size)
-                    weights.append(weight)
+                    if key not in self.user_feats:
+                        weights.append(weight)
+
+            # all_values = user_values + values
+
+            all_values_tiled = torch.cat(
+                [user_values_tiled, torch.cat(values, dim=-1)], dim=-1
+            )
+            all_lengths_tiled = torch.cat(
+                [user_lengths_tiled, torch.cat(lengths, dim=-1)], dim=-1
+            )
+            if len(user_weights) > 0 and len(weights) > 0:
+                all_weights_tiled = torch.cat(
+                    [user_weights_tiled, torch.cat(weights, dim=-1)], dim=-1
+                )
+            elif len(weights) > 0:
+                all_weights_tiled = torch.cat(weights, dim=-1)
+            else:
+                all_weights_tiled = None
 
             sparse_feature = KeyedJaggedTensor(
                 keys=keys,
-                values=torch.cat(values, dim=-1),
-                lengths=torch.cat(lengths, dim=-1),
-                weights=torch.cat(weights, dim=-1)
-                if len(dg_has_weight_keys) > 0
-                else None,
-                stride=lengths[0].size(0),  # input_data['input_batch_size']
-                length_per_key=[x.numel() for x in values],
+                values=all_values_tiled,
+                lengths=all_lengths_tiled,
+                weights=all_weights_tiled,
+                stride=input_data[
+                    "batch_size"
+                ].item(),  # input_data['input_batch_size']
+                # length_per_key=[x.numel() for x in all_values],
             )
             sparse_features[dg] = sparse_feature
             if len(mulval_keys) > 0:
