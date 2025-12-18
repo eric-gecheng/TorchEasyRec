@@ -32,6 +32,11 @@ def use_rtp() -> bool:
     return flag
 
 
+def export_split() -> bool:
+    """Export model in sparse/dense split mode or not."""
+    return os.environ.get("EXPORT_SPLIT", "0") == "1"
+
+
 def enable_tma() -> bool:
     """Enable TMA (Tensor Memory Accelerator) for triton ops."""
     flag = os.environ.get("ENABLE_TMA", "0") == "1"
