@@ -25,6 +25,23 @@ from tzrec.utils.test_util import (
 from tzrec.utils.test_util import hypothesis_settings as settings
 
 
+def _retry(max_attempts=3):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    print(f"run {attempt + 1} failed: {e}")
+                    if attempt >= max_attempts - 1:
+                        raise
+            return None
+
+        return wrapper
+
+    return decorator
+
+
 class PositionEmbeddingsTest(unittest.TestCase):
     def teardown_example(self, example):
         gc.collect()
@@ -161,7 +178,8 @@ class PositionEmbeddingsTest(unittest.TestCase):
         batch_size=st.integers(16, 32),
         D=st.integers(20, 200),
         max_targets=st.sampled_from([10, 20]),
-        time_bucket_fn=st.sampled_from(["log"]),
+        time_bucket_fn=st.sampled_from(["sqrt", "log"]),
+        time_bucket_increments=st.integers(10, 100),
         dtype=st.sampled_from(
             get_test_dtypes([torch.float32, torch.bfloat16, torch.float16])
         ),
@@ -191,7 +209,8 @@ class PositionEmbeddingsTest(unittest.TestCase):
         batch_size=st.sampled_from([130]),
         D=st.sampled_from([128]),
         max_targets=st.sampled_from([10]),
-        time_bucket_fn=st.sampled_from(["log"]),
+        time_bucket_fn=st.sampled_from(["sqrt", "log"]),
+        time_bucket_increments=st.integers(10, 100),
         dtype=st.sampled_from(get_test_dtypes([torch.bfloat16, torch.float16])),
     )
     @settings(
@@ -215,6 +234,8 @@ class PositionEmbeddingsTest(unittest.TestCase):
             sparsity=1.0,
         )
 
+    # the test case may fail, when ts_ind is on bucket boundary, so we retry it
+    @_retry(max_attempts=3)
     def _test_add_timestamp_positional_embeddings(
         self,
         alpha: float,
@@ -225,6 +246,7 @@ class PositionEmbeddingsTest(unittest.TestCase):
         D: int,
         max_targets: int,
         time_bucket_fn: str,
+        time_bucket_increments: float,
         dtype: torch.dtype,
         ref_kernel: Kernel,
         real_kernel: Kernel,
@@ -236,7 +258,7 @@ class PositionEmbeddingsTest(unittest.TestCase):
         )
 
         num_targets = torch.randint(
-            max_targets + 1, size=(batch_size,), device=torch.device("cuda")
+            low=1, high=max_targets + 1, size=(batch_size,), device=torch.device("cuda")
         )
         if sparsity > 0.0:
             lengths = generate_sparse_seq_len(
@@ -249,11 +271,16 @@ class PositionEmbeddingsTest(unittest.TestCase):
             lengths = torch.randint(
                 max_uih_len + 1, size=(batch_size,), device=torch.device("cuda")
             )
+        if interleave_targets:
+            seq_lengths = max_contextual_seq_len + lengths + num_targets * 2
+            max_seq_len = max_contextual_seq_len + max_uih_len + max_targets * 2
+        else:
+            seq_lengths = max_contextual_seq_len + lengths + num_targets
+            max_seq_len = max_contextual_seq_len + max_uih_len + max_targets
         seq_offsets = torch.zeros(
             (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
         )
-        seq_offsets[1:] = torch.cumsum(lengths, dim=0)
-        max_seq_len = max_uih_len + max_targets
+        seq_offsets[1:] = torch.cumsum(seq_lengths, dim=0)
 
         position_embeddings_weight = (
             torch.empty(
@@ -287,9 +314,9 @@ class PositionEmbeddingsTest(unittest.TestCase):
             device="cuda",
         )
         timestamps = timestamp_deltas.cumsum(dim=1)
-        mask = torch.arange(max_seq_len, device=timestamps.device) < lengths.unsqueeze(
-            1
-        )
+        mask = torch.arange(
+            max_seq_len, device=timestamps.device
+        ) < seq_lengths.unsqueeze(1)
         timestamps = timestamps[mask.view(batch_size, -1)]
 
         ref_out = add_timestamp_positional_embeddings(
@@ -299,12 +326,13 @@ class PositionEmbeddingsTest(unittest.TestCase):
             position_embeddings_weight=position_embeddings_weight,
             timestamp_embeddings_weight=timestamp_embeddings_weight,
             seq_offsets=seq_offsets,
-            seq_lengths=lengths,
+            seq_lengths=seq_lengths,
             seq_embeddings=seq_embeddings,
             timestamps=timestamps,
             num_targets=num_targets,
             interleave_targets=interleave_targets,
             time_bucket_fn=time_bucket_fn,
+            time_bucket_increments=time_bucket_increments,
             kernel=ref_kernel,
         )
         dout = torch.randn_like(ref_out) * 0.01
@@ -327,15 +355,15 @@ class PositionEmbeddingsTest(unittest.TestCase):
             position_embeddings_weight=position_embeddings_weight,
             timestamp_embeddings_weight=timestamp_embeddings_weight,
             seq_offsets=seq_offsets,
-            seq_lengths=lengths,
+            seq_lengths=seq_lengths,
             seq_embeddings=seq_embeddings,
             timestamps=timestamps,
             num_targets=num_targets,
             interleave_targets=interleave_targets,
             time_bucket_fn=time_bucket_fn,
+            time_bucket_increments=time_bucket_increments,
             kernel=real_kernel,
         )
-
         torch.testing.assert_close(ref_out, real_out)
         if test_backward:
             real_out.backward(dout)

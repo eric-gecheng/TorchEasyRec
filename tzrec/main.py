@@ -32,6 +32,7 @@ from torchrec.optim.apply_optimizer_in_backward import (
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import SGD, in_backward_optimizer_filter
 
+from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.constant import (
     PREDICT_QUEUE_TIMEOUT,
@@ -59,7 +60,6 @@ from tzrec.models.match_model import (
 )
 from tzrec.models.model import (
     BaseModel,
-    CudaExportWrapper,
     PredictWrapper,
     ScriptWrapper,
     TrainWrapper,
@@ -320,6 +320,7 @@ def _train_and_evaluate(
     ckpt_path: Optional[str] = None,
     eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
     check_all_workers_data_status: bool = False,
+    ignore_restore_optimizer: bool = False,
 ) -> None:
     """Train and evaluate the model."""
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
@@ -396,15 +397,21 @@ def _train_and_evaluate(
 
         train_iterator = iter(train_dataloader)
 
-        # Restore model and optimizer checkpoint, because optimizer's state
-        # is lazy init, we should do a dummy step before restore.
+        # Restore model and optimizer checkpoint
         if i_step == 0 and ckpt_path is not None:
-            peek_batch = next(train_iterator)
-            pipeline.progress(iter([peek_batch]))
-            train_iterator = itertools.chain([peek_batch], train_iterator)
-            checkpoint_util.restore_model(
-                ckpt_path, model, optimizer, train_config.fine_tune_ckpt_param_map
-            )
+            if ignore_restore_optimizer:
+                checkpoint_util.restore_model(
+                    ckpt_path, model, None, train_config.fine_tune_ckpt_param_map
+                )
+            else:
+                # because optimizer's state is lazy init, we should do a dummy
+                # step before restore.
+                peek_batch = next(train_iterator)
+                pipeline.progress(iter([peek_batch]))
+                train_iterator = itertools.chain([peek_batch], train_iterator)
+                checkpoint_util.restore_model(
+                    ckpt_path, model, optimizer, train_config.fine_tune_ckpt_param_map
+                )
 
         for i_step in step_iter:
             if i_step <= skip_steps:
@@ -522,9 +529,10 @@ def train_and_evaluate(
     train_input_path: Optional[str] = None,
     eval_input_path: Optional[str] = None,
     model_dir: Optional[str] = None,
-    continue_train: Optional[bool] = True,
+    continue_train: bool = False,
     fine_tune_checkpoint: Optional[str] = None,
     edit_config_json: Optional[str] = None,
+    ignore_restore_optimizer: bool = False,
 ) -> None:
     """Train and evaluate a EasyRec model.
 
@@ -533,11 +541,13 @@ def train_and_evaluate(
         train_input_path (str, optional): train data path.
         eval_input_path (str, optional): eval data path.
         model_dir (str, optionl): model directory.
-        continue_train (bool, optional): whether to restart train from
+        continue_train (bool): whether to restart train from
             an existing checkpoint.
         fine_tune_checkpoint (str, optional): path to an existing
             finetune checkpoint.
         edit_config_json (str, optional): edit pipeline config json str.
+        ignore_restore_optimizer (bool): whether to restore optimizer
+            state from checkpoint.
     """
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
     train_config = pipeline_config.train_config
@@ -668,6 +678,8 @@ def train_and_evaluate(
         remaining_params,
         lambda params: dense_optim_cls(params, **dense_optim_kwargs),
     )
+    # it is necessary to know the index that can match the parameter part_optimizer
+    # for lr scheduler use
     part_optimizers, part_optim_indices = optimizer_builder.build_part_optimizers(
         part_optim_cls, part_optim_kwargs, part_optim_params
     )
@@ -718,6 +730,7 @@ def train_and_evaluate(
         skip_steps=skip_steps,
         ckpt_path=ckpt_path,
         check_all_workers_data_status=check_all_workers_data_status,
+        ignore_restore_optimizer=ignore_restore_optimizer,
     )
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
@@ -864,7 +877,7 @@ def export(
         list(data_config.label_fields),
         sampler_type=None,
     )
-    InferWrapper = CudaExportWrapper if acc_utils.is_aot() else ScriptWrapper
+    InferWrapper = ScriptWrapper
     model = InferWrapper(model)
 
     if not checkpoint_path:
@@ -1071,11 +1084,8 @@ def predict(
     )
 
     if is_aot:
-        model: torch.export.pt2_archive._package.AOTICompiledModel = (
-            torch._inductor.aoti_load_package(
-                os.path.join(scripted_model_path, "aoti_model.pt2"),
-                device_index=device.index,
-            )
+        model: aot_utils.CombinedModelWrapper = aot_utils.load_model_aot(
+            scripted_model_path, device=device
         )
     else:
         # disable jit compile， as it compile too slow now.
@@ -1117,11 +1127,7 @@ def predict(
                 # when predicting with a model exported using INPUT_TILE,
                 #  we set the batch size tensor to 1 to disable tiling.
                 parsed_inputs["batch_size"] = torch.tensor(1, dtype=torch.int64)
-            if is_trt or is_aot:
-                parsed_inputs = OrderedDict(sorted(parsed_inputs.items()))
-                predictions = model(parsed_inputs)
-            else:
-                predictions = model(parsed_inputs, device)
+            predictions = model(parsed_inputs, device)
             if device.type == "cuda":
                 predictions = {k: v.to("cpu") for k, v in predictions.items()}
             return predictions, batch.reserves

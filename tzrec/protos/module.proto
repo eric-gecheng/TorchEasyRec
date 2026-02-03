@@ -96,6 +96,17 @@ message CIN {
     repeated uint32 cin_layer_size = 1;
 }
 
+message WuKongLayer {
+    // LinearCompressBlock output feature num
+    required uint32 lcb_feature_num = 1;
+    // FactorizationMachineBlock output feature num
+    required uint32 fmb_feature_num = 2;
+    // number of compressed features in optimized FM.
+    optional uint32 compressed_feature_num = 3 [default = 16];
+    // feature num mlp
+    required MLP feature_num_mlp = 4;
+}
+
 message GRSimpleActionEncoder {
     // action embedding dim
     optional uint32 action_embedding_dim = 1;
@@ -253,6 +264,10 @@ message GRPositionalEncoder {
     optional uint32 num_time_buckets = 2;
     // use timestamp encoding or not.
     optional bool use_time_encoding = 3 [default = false];
+    // transform function for timestamp gap. sqrt | log
+    optional string time_bucket_fn = 4 [default = "sqrt"];
+    // timestamp gap will div by time_bucket_increments
+    optional float time_bucket_increments = 5 [default = 60.0];
 }
 
 message HSTU {

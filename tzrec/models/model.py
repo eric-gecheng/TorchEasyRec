@@ -26,6 +26,7 @@ from tzrec.constant import TRAGET_REPEAT_INTERLEAVE_KEY
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
+from tzrec.loss.pe_mtl_loss import ParetoEfficientMultiTaskLoss
 from tzrec.modules.utils import BaseModule
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
@@ -245,6 +246,14 @@ class TrainWrapper(BaseModule):
             raise ValueError(
                 f"mixed_precision should be FP16 or BF16, but got [{mixed_precision}]"
             )
+        self.pareto = None
+        if (
+            hasattr(self.model, "_use_pareto_loss_weight")
+            and self.model._use_pareto_loss_weight
+        ):
+            self.pareto = ParetoEfficientMultiTaskLoss(
+                self.model._pareto_init_weight_cs
+            )
 
     def forward(self, batch: Batch) -> TRAIN_FWD_TYPE:
         """Predict and compute loss.
@@ -265,7 +274,10 @@ class TrainWrapper(BaseModule):
         ):
             predictions = self.model.predict(batch)
             losses = self.model.loss(predictions, batch)
-            total_loss = torch.stack(list(losses.values())).sum()
+            if self.training and self.pareto:
+                total_loss = self.pareto(losses, self.model)
+            else:
+                total_loss = torch.stack(list(losses.values())).sum()
 
         losses = {k: v.detach() for k, v in losses.items()}
         predictions = {k: v.detach() for k, v in predictions.items()}
@@ -377,22 +389,34 @@ class ScriptWrapper(BaseModule):
         return self.model.predict(batch)
 
 
-class CudaExportWrapper(ScriptWrapper):
-    """Model inference wrapper for cuda export(aot/trt)."""
+class CombinedModelWrapper(nn.Module):
+    """Model inference wrapper for model combined with sparse and dense part.
 
-    # pyre-ignore [14]
+    Args:
+        sparse_model (nn.Module): sparse part scripted model.
+        dense_model (nn.Module): dense part AOTInductor model.
+    """
+
+    def __init__(self, sparse_model: nn.Module, dense_model: nn.Module) -> None:
+        super().__init__()
+        self.sparse_model = sparse_model
+        self.dense_model = dense_model
+
     def forward(
         self,
         data: Dict[str, torch.Tensor],
+        # pyre-ignore [9]
+        device: torch.device = "cuda:0",
     ) -> Dict[str, torch.Tensor]:
         """Predict the model.
 
         Args:
             data (dict): a dict of input data for Batch.
+            device (torch.device): inference device.
 
         Return:
             predictions (dict): a dict of predicted result.
         """
-        batch = self._data_parser.to_batch(data)
-        batch = batch.to(torch.device("cuda"), non_blocking=True)
-        return self.model.predict(batch)
+        sparse_out, _ = self.sparse_model(data, device)
+        outputs = self.dense_model(sparse_out)
+        return outputs
