@@ -45,6 +45,7 @@ from tzrec.protos.model_pb2 import FeatureGroupConfig, SeqGroupConfig
 from tzrec.utils.fx_util import (
     fx_int_item,
     fx_mark_keyed_tensor,
+    fx_mark_seq_ec_jt,
     fx_mark_seq_len,
     fx_mark_seq_tensor,
     fx_mark_tensor,
@@ -58,6 +59,7 @@ torch.fx.wrap(fx_mark_keyed_tensor)
 torch.fx.wrap(fx_mark_tensor)
 torch.fx.wrap(fx_mark_seq_tensor)
 torch.fx.wrap(fx_mark_seq_len)
+torch.fx.wrap(fx_mark_seq_ec_jt)
 
 
 @torch.fx.wrap
@@ -855,7 +857,9 @@ class EmbeddingGroupImpl(nn.Module):
             kts.append(kt)
 
         if self.has_dense:
-            fx_mark_keyed_tensor(self._all_group_str + "__dense", dense_feature)
+            fx_mark_keyed_tensor(
+                self._all_group_str + "__dense", dense_feature, is_dense=True
+            )
             if self.has_dense_embedding:
                 kts.append(self.dense_ec(dense_feature))
             else:
@@ -931,6 +935,11 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         self._group_to_is_jagged = dict()
         self._group_to_sequence_length = OrderedDict()
 
+        self.seq_sparse_keys: List[str] = []
+        self.seq_sparse_keys_user: List[str] = []
+        self.query_sparse_keys: List[str] = []
+        self.query_sparse_keys_user: List[str] = []
+
         feat_to_group_to_emb_name = defaultdict(dict)
         for feature_group in feature_groups:
             group_name = feature_group.group_name
@@ -968,7 +977,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             for name in feature_names:
                 shared_name = name
                 feature = name_to_feature[name]
+
                 if feature.is_sparse:
+                    if shared_feature_flag[name]:
+                        shared_name = shared_name + "@" + emb_config.name
                     output_dim = feature.output_dim
                     emb_config = feature.emb_config
                     mc_module = feature.mc_module(device)
@@ -1004,6 +1016,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                                 ] = const
                         if feature.is_sequence and feature.value_dim != 1:
                             self.has_mulval_seq_user = True
+                        if feature.is_sequence:
+                            self.seq_sparse_keys_user.append(shared_name)
+                        else:
+                            self.query_sparse_keys_user.append(shared_name)
                     else:
                         emb_configs = (
                             dim_to_mc_emb_configs[embedding_dim]
@@ -1030,9 +1046,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                                 ] = const
                         if feature.is_sequence and feature.value_dim != 1:
                             self.has_mulval_seq = True
-
-                    if shared_feature_flag[name]:
-                        shared_name = shared_name + "@" + emb_config.name
+                        if feature.is_sequence:
+                            self.seq_sparse_keys.append(shared_name)
+                        else:
+                            self.query_sparse_keys.append(shared_name)
                 else:
                     output_dim = feature.output_dim
                     if feature.is_sequence:
@@ -1152,7 +1169,17 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
         if self.has_sparse:
             for ec in self.ec_dict.values():
-                sparse_jt_dict_list.append(ec(sparse_feature))
+                d_jt = ec(sparse_feature)
+                new_d_jt = {}
+                for k in self.seq_sparse_keys:
+                    val = d_jt[k]
+                    fx_mark_seq_ec_jt(f"{k}", val)
+                    new_d_jt[k] = val
+                for k in self.query_sparse_keys:
+                    val = d_jt[k]
+                    fx_mark_seq_ec_jt(f"{k}", val)
+                    new_d_jt[k] = val
+                sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mc_sparse:
             for ec in self.mc_ec_dict.values():
@@ -1163,7 +1190,17 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
         if self.has_sparse_user:
             for ec in self.ec_dict_user.values():
-                sparse_jt_dict_list.append(ec(sparse_feature_user))
+                d_jt = ec(sparse_feature_user)
+                new_d_jt = {}
+                for k in self.seq_sparse_keys_user:
+                    val = d_jt[k]
+                    fx_mark_seq_ec_jt(f"{k}", val)
+                    new_d_jt[k] = val
+                for k in self.query_sparse_keys_user:
+                    val = d_jt[k]
+                    fx_mark_seq_ec_jt(f"{k}", val)
+                    new_d_jt[k] = val
+                sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mc_sparse_user:
             for ec in self.mc_ec_dict_user.values():

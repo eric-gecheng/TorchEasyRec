@@ -28,7 +28,7 @@ from torch import distributed as dist
 from torch import nn
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed._tensor import DTensor
-from torchrec import KeyedTensor
+from torchrec import JaggedTensor, KeyedTensor
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.utils import Tracer
 from torchrec.inference.modules import quantize_embeddings
@@ -62,6 +62,7 @@ from tzrec.utils.dist_util import DistributedModelParallel, init_process_group
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
     fx_mark_keyed_tensor,
+    fx_mark_seq_ec_jt,
     fx_mark_seq_len,
     fx_mark_seq_tensor,
     fx_mark_tensor,
@@ -81,11 +82,11 @@ def export_model(
 ) -> None:
     """Export a EasyRec model, may be a part of model in PipelineConfig."""
     use_rtp = env_util.use_rtp()
-    use_split = env_util.export_split()
+    use_dist_embedding = env_util.use_distributed_embedding()
     if use_rtp:
         impl = export_rtp_model
-    elif use_split:
-        impl = export_split_model
+    elif use_dist_embedding:
+        impl = export_distributed_embedding
     else:
         impl = export_model_normal
     fs, local_path = url_to_fs(save_dir)
@@ -1089,7 +1090,7 @@ def split_model(
     return sparse_gm, dense_gm
 
 
-def export_split_model(
+def export_distributed_embedding(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
     checkpoint_path: Optional[str],
@@ -1097,7 +1098,7 @@ def export_split_model(
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
 ) -> List[nn.Module]:
-    """Split an EasyRec model into sparse part and dense part."""
+    """Export for online serving under distributed embedding mode."""
     device, _ = init_process_group()
     rank = int(os.environ.get("RANK", 0))
     # local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -1113,7 +1114,9 @@ def export_split_model(
     if not checkpoint_path:
         raise ValueError("checkpoint path should be specified.")
 
-    feature_to_embedding_info = _get_sparse_feature_to_embedding_info(model)
+    feature_to_embedding_bag_info, feature_to_embedding_info = (
+        _get_sparse_feature_to_embedding_info(model)
+    )
 
     # make dataparser to get user feats before create model
     data_config = pipeline_config.data_config
@@ -1179,6 +1182,8 @@ def export_split_model(
     for node in list(graph.nodes):
         if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
             name = node.args[0]
+            if node.kwargs.get("is_dense", False):
+                continue
             node_kt = node.args[1]
             with graph.inserting_after(node_kt):
                 outputs[name] = graph.call_method("values", args=(node_kt,))
@@ -1188,27 +1193,23 @@ def export_split_model(
                 output_attrs[name + "__keys"] = graph.call_method(
                     "keys", args=(node_kt,)
                 )
-        elif node.op == "call_function" and node.target == fx_mark_tensor:
-            # query
+        elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
             name = node.args[0]
-            t = node.args[1]
-            outputs[name] = t
-        elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
-            # sequence
-            seq_name = node.args[0]
-            name = _seq_feat_name(seq_name)
-            t = node.args[1]
-            outputs[name] = t
-        elif node.op == "call_function" and node.target == fx_mark_seq_len:
-            # sequence length
-            name = _seq_len_name(node.args[0])
-            t = node.args[1]
-            outputs[name] = t
+            node_jt = node.args[1]
+            with graph.inserting_after(node_jt):
+                outputs[name] = graph.call_method("values", args=(node_jt,))
+                outputs[name + "__lengths"] = graph.call_method(
+                    "lengths", args=(node_jt,)
+                )
+                output_attrs[name + "__lengths"] = graph.call_method(
+                    "lengths", args=(node_jt,)
+                )
 
     graph.output(tuple([outputs, output_attrs]))
     sparse_gm = torch.fx.GraphModule(unwrap_model, graph)
     sparse_gm.graph.eliminate_dead_code()
     sparse_gm = _prune_unused_param_and_buffer(sparse_gm)
+
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_sparse.graph"), "w") as f:
             f.write(str(sparse_gm.graph))
@@ -1226,13 +1227,19 @@ def export_split_model(
     logger.info("saving sparse parameters...")
 
     local_tensor, meta = _get_sparse_embedding_tensor(
-        sparse_model, checkpoint_path, feature_to_embedding_info.values()
+        sparse_model,
+        checkpoint_path,
+        feature_to_embedding_info.values(),
+        feature_to_embedding_bag_info.values(),
     )
     local_tensor_name = f"sparse_embeddings-{rank:06d}-of-{world_size:06d}"
-    local_tensor_path = os.path.join(save_dir, f"{local_tensor_name}.npz")
+    save_dir_sparse = f"{save_dir}/sparse"
+    if not os.path.exists(save_dir_sparse):
+        os.makedirs(save_dir_sparse)
+    local_tensor_path = os.path.join(save_dir_sparse, f"{local_tensor_name}.npz")
     logger.info(f"save sparse tensors to {local_tensor_path}")
     np.savez(local_tensor_path, **local_tensor)
-    with open(os.path.join(save_dir, f"{local_tensor_name}.json"), "w") as f:
+    with open(os.path.join(save_dir_sparse, f"{local_tensor_name}.json"), "w") as f:
         json.dump(meta, f, indent=4)
 
     # Extract Dense Model
@@ -1242,7 +1249,7 @@ def export_split_model(
     graph = copy.deepcopy(full_graph)
     output_keys = []
     output_values = []
-    mc_config = defaultdict()
+    dense_graph_config = defaultdict()
     for node in graph.nodes:
         if node.op == "output":
             for k, v in sorted(node.args[0].items()):
@@ -1253,33 +1260,12 @@ def export_split_model(
             graph.erase_node(node)
     input_node = next(node for node in graph.nodes if node.op == "placeholder")
 
-    seq_len_nodes = {}
-    for node in graph.nodes:
-        if node.op == "call_function" and node.target == fx_mark_seq_len:
-            # sequence_length
-            seq_name = node.args[0]
-            name = _seq_len_name(seq_name)
-            node_t = node.args[1]
-            with graph.inserting_before(node_t):
-                get_node = graph.call_function(
-                    operator.getitem, args=(input_node, name)
-                )
-                seq_len_nodes[seq_name] = get_node
-                # add sequence_length into fg
-                additional_fg.append(
-                    {
-                        "feature_name": name,
-                        "feature_type": "raw_feature",
-                        "expression": f"user:{name}",
-                    }
-                )
-                logger.info(f"You should add additional feature [{name}] into qinfo.")
-                mc_config[name] = [name]
-            node_t.replace_all_uses_with(get_node)
-
+    dense_graph_config["sequence__ec"] = []
     for node in list(graph.nodes):
         if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
             name = node.args[0]
+            if node.kwargs.get("is_dense", False):
+                continue
             node_kt = node.args[1]
             with graph.inserting_before(node_kt):
                 getitem_node = graph.call_function(
@@ -1293,48 +1279,50 @@ def export_split_model(
                         "values": getitem_node,
                     },
                 )
-                mc_config[name] = new_node.kwargs["keys"]
+                dense_graph_config[name] = [
+                    k + "__ebc" for k in new_node.kwargs["keys"]
+                ]
                 node_kt.replace_all_uses_with(new_node)
-        elif node.op == "call_function" and node.target == fx_mark_tensor:
-            # query
+        elif node.op == "call_function" and node.target == fx_mark_seq_ec_jt:
             name = node.args[0]
-            node_t = node.args[1]
-            with graph.inserting_before(node_t):
-                new_node = graph.call_function(
+            node_jt = node.args[1]
+
+            with graph.inserting_before(node_jt):
+                getitem_node = graph.call_function(
                     operator.getitem, args=(input_node, name)
                 )
-                mc_config[name] = node.kwargs["keys"]
-            node_t.replace_all_uses_with(new_node)
-        elif node.op == "call_function" and node.target == fx_mark_seq_tensor:
-            # sequence
-            seq_name = node.args[0]
-            name = _seq_feat_name(seq_name)
-            node_t = node.args[1]
-            with graph.inserting_before(node_t):
-                new_node = graph.call_function(
-                    operator.getitem, args=(input_node, name)
+                getitem_lengths = graph.call_function(
+                    operator.getitem, args=(input_node, name + "__lengths")
                 )
+                new_node = graph.call_function(
+                    JaggedTensor,
+                    kwargs={
+                        "values": getitem_node,
+                        "lengths": getitem_lengths,
+                    },
+                )
+            node_jt.replace_all_uses_with(new_node)
+            emb_name = name + "__ec"
+            dense_graph_config["sequence__ec"].append(emb_name)
+            dense_graph_config["sequence__ec"].append(name + "__lengths")
 
-                if node.kwargs["is_jagged_seq"]:
-                    new_node = graph.call_function(torch.squeeze, args=(new_node, 0))
-                mc_config[name] = node.kwargs["keys"]
-            node_t.replace_all_uses_with(new_node)
-
-    graph.output(tuple(output_values))
+    graph.output(dict(zip(output_keys, output_values)))
     gm = torch.fx.GraphModule(unwrap_model, graph)
     gm.graph.eliminate_dead_code()
     gm = _prune_unused_param_and_buffer(gm)
+
     init_parameters(gm, device)
     gm.to(device)
     checkpoint_util.restore_model(checkpoint_path, gm)
 
     if is_rank_zero:
         with open(os.path.join(save_dir, "dense_meta.json"), "w") as f:
-            json.dump(mc_config, f, indent=4)
+            json.dump(dense_graph_config, f, indent=4)
 
         with open(os.path.join(graph_dir, "gm_dense.graph"), "w") as f:
             f.write(str(gm.graph))
-        _ = gm(sparse_output)
+        data.update(sparse_output)
+        _ = gm(data, device)
 
         dense_model_traced = symbolic_trace(gm)
 
@@ -1344,16 +1332,17 @@ def export_split_model(
         dense_model_scripted = torch.jit.script(dense_model_traced)
         dense_model_scripted.save(os.path.join(save_dir, "scripted_model.pt"))
 
-        # Save Dense Model
-        # when batch_size=1, we assume gr model.
-        # dynamic = data_config.batch_size > 1
-        # # remove device metadata assert to fix: torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function aten._assert_tensor_metadata.default*(FakeTensor(..., device-'cuda:0', size-(u1, 512)), None, None, torch. float32), **{'device': device(type-'cuda", index-0), 'layout': torch.strided}): got RuntimeError(Tensor device mismatch!')   # NOQA
-        # with torch._export.utils._disable_aten_to_metadata_assertions():
-        #     fx_tool = ExportTorchFxTool(
-        #         os.path.join(save_dir, "fx_user_model"), dynamic=dynamic
-        #     )
-        #     fx_tool.set_output_nodes_name(output_keys)
-        #     fx_tool.export_fx_model(gm, sparse_output, mc_config)
+        logger.info("saving pipeline.config...")
+        feature_configs = create_feature_configs(features, asset_dir=save_dir)
+        pipeline_config = copy.copy(pipeline_config)
+        pipeline_config.ClearField("feature_configs")
+        pipeline_config.feature_configs.extend(feature_configs)
+        config_util.save_message(
+            pipeline_config, os.path.join(save_dir, "pipeline.config")
+        )
+
+        with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
+            json.dump(acc_utils.export_acc_config(), f, indent=4)
 
         has_fg_asset = False
         if assets is not None:
@@ -1374,7 +1363,7 @@ def export_split_model(
     if is_rank_zero:
         # merge sharded sparse meta files
         emb_json_file_names = glob.glob(
-            os.path.join(save_dir, "sparse_embeddings*.json")
+            os.path.join(save_dir_sparse, "sparse_embeddings*.json")
         )
         emb_json_files = []
         for emb_j in emb_json_file_names:
@@ -1383,7 +1372,7 @@ def export_split_model(
                 emb_json_files.append(data_j)
 
         merged_emb_json = _merge_sharded_embedding_json(emb_json_files)
-        with open(os.path.join(save_dir, "sparse_embedding.json"), "w") as f:
+        with open(os.path.join(save_dir_sparse, "sparse_embedding.json"), "w") as f:
             json.dump(merged_emb_json, f, indent=4)
 
 
@@ -1405,48 +1394,65 @@ def _merge_sharded_embedding_json(
 
 def _get_sparse_feature_to_embedding_info(
     model: nn.Module,
-) -> Dict[str, BaseEmbeddingConfig]:
+) -> Tuple[Dict[str, BaseEmbeddingConfig], Dict[str, BaseEmbeddingConfig]]:
+    feature_to_embedding_bag_info = dict()
     feature_to_embedding_info = dict()
-    feature_to_module_path = dict()
-    emb_name_to_module_path = dict()
     q = Queue()
     q.put(("", model))
     while not q.empty():
         child_path, m = q.get()
-        if isinstance(m, EmbeddingBagCollectionInterface) or isinstance(
-            m, EmbeddingCollectionInterface
-        ):
-            embedding_configs = (
-                m.embedding_bag_configs()
-                if isinstance(m, EmbeddingBagCollectionInterface)
-                else m.embedding_configs()
-            )
+        if isinstance(m, EmbeddingBagCollectionInterface):
+            embedding_configs = m.embedding_bag_configs()
             for t in embedding_configs:
-                emb_name_to_module_path[t.name] = child_path
+                for fname in t.feature_names:
+                    feature_to_embedding_bag_info[fname] = t
+
+        elif isinstance(m, EmbeddingCollectionInterface):
+            embedding_configs = m.embedding_configs()
+            for t in embedding_configs:
                 for fname in t.feature_names:
                     feature_to_embedding_info[fname] = t
-                    feature_to_module_path[fname] = child_path
         else:
             for name, child in m.named_children():
                 if child_path == "":
                     q.put((name, child))
                 else:
                     q.put((f"{child_path}.{name}", child))
-    return feature_to_embedding_info
+
+    return feature_to_embedding_bag_info, feature_to_embedding_info
 
 
 def _get_sparse_embedding_tensor(
-    model: nn.Module, checkpoint_path: str, embedding_infos: List[BaseEmbeddingConfig]
+    model: nn.Module,
+    checkpoint_path: str,
+    embedding_infos: List[BaseEmbeddingConfig],
+    embedding_bag_info: List[BaseEmbeddingConfig],
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     """Get Embedding Tensors for sparse part."""
     emb_name_to_emb_dim = dict()
     feat_name_to_pooling = dict()
     for emb_info in embedding_infos:
-        emb_name_to_emb_dim[emb_info.name] = emb_info.embedding_dim
+        emb_name_impl = emb_info.name + "__ec"
+        emb_name_to_emb_dim[emb_name_impl] = emb_info.embedding_dim
         feat_name = (
             emb_info.name[:-4] if emb_info.name.endswith("_emb") else emb_info.name
         )
-        feat_name_to_pooling[feat_name] = str(emb_info.pooling).split(".")[-1]
+        feat_name_impl = feat_name + "__ec"
+        if hasattr(emb_info, "pooling"):
+            feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[-1]
+        else:
+            feat_name_to_pooling[feat_name_impl] = "NONE"
+    for emb_info in embedding_bag_info:
+        emb_name_impl = emb_info.name + "__ebc"
+        emb_name_to_emb_dim[emb_name_impl] = emb_info.embedding_dim
+        feat_name = (
+            emb_info.name[:-4] if emb_info.name.endswith("_emb") else emb_info.name
+        )
+        feat_name_impl = feat_name + "__ebc"
+        if hasattr(emb_info, "pooling"):
+            feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[-1]
+        else:
+            feat_name_to_pooling[feat_name_impl] = "NONE"
 
     def _remove_prefix(src: str, prefix: str = "torch.") -> str:
         if src.startswith(prefix):
@@ -1460,8 +1466,15 @@ def _get_sparse_embedding_tensor(
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     for name, values in model.state_dict().items():
         emb_name = name.split(".")[-2]
+        emb_impl_type = name.split(".")[2]  # 'emb_impls' or 'seq_emb_impls'
         feat_name = emb_name[:-4] if emb_name.endswith("_emb") else emb_name
-        emb_dim = emb_name_to_emb_dim[emb_name]
+        feat_name_impl = (
+            feat_name + "__ebc" if emb_impl_type == "emb_impls" else feat_name + "__ec"
+        )
+        emb_name_impl = (
+            emb_name + "__ebc" if emb_impl_type == "emb_impls" else emb_name + "__ec"
+        )
+        emb_dim = emb_name_to_emb_dim[emb_name_impl]
         if isinstance(values, DTensor):
             raise ValueError("DTensors are not considered yet.")
         elif isinstance(values, ShardedTensor):
@@ -1477,14 +1490,14 @@ def _get_sparse_embedding_tensor(
                         local_tensor = values.local_tensor().cpu().numpy()
                         if list(local_tensor.shape)[-1] == emb_dim:
                             # dynamicemb may have a dummy tensor in state_dict, skip it.
-                            out[feat_name] = local_tensor
-                            value_name_to_key[feat_name] = None
-                            shard_offsets[feat_name] = shards_meta.shard_offsets
+                            out[feat_name_impl] = local_tensor
+                            value_name_to_key[feat_name_impl] = None
+                            shard_offsets[feat_name_impl] = shards_meta.shard_offsets
         elif list(values.shape)[-1] == emb_dim:
             # dynamicemb may have a dummy tensor in state_dict, skip it.
-            out[feat_name] = values
-            value_name_to_key[feat_name] = None
-            shard_offsets[feat_name] = shards_meta.shard_offsets
+            out[feat_name_impl] = values
+            value_name_to_key[feat_name_impl] = None
+            shard_offsets[feat_name_impl] = shards_meta.shard_offsets
 
     dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
     if os.path.exists(dynamicemb_path):
