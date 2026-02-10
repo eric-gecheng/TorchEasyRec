@@ -1211,21 +1211,32 @@ def export_distributed_embedding(
     # Save Sparse Parameters
     logger.info("saving sparse parameters...")
 
-    local_tensor, meta = _get_sparse_embedding_tensor(
+    local_tensor, emb_meta, feat_meta = _get_sparse_embedding_tensor(
         sparse_model,
         checkpoint_path,
         feature_to_embedding_info.values(),
         feature_to_embedding_bag_info.values(),
     )
-    local_tensor_name = f"sparse_embeddings-{rank:06d}-of-{world_size:06d}"
+    local_tensor_name = f"sparse_embeddings-{rank:02d}-of-{world_size:02d}"
     save_dir_sparse = f"{save_dir}/sparse"
     if not os.path.exists(save_dir_sparse):
         os.makedirs(save_dir_sparse)
     local_tensor_path = os.path.join(save_dir_sparse, f"{local_tensor_name}.npz")
     logger.info(f"save sparse tensors to {local_tensor_path}")
-    np.savez(local_tensor_path, **local_tensor)
+    # np.savez(local_tensor_path, **local_tensor)
+    import tempfile
+
+    # OSS mounted file system may have problem in file seek, so first
+    # save to a temp file then move to target path
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f:
+        np.savez(f, **local_tensor)
+        temp_path = f.name
+    shutil.move(temp_path, local_tensor_path)
     with open(os.path.join(save_dir_sparse, f"{local_tensor_name}.json"), "w") as f:
-        json.dump(meta, f, indent=4)
+        json.dump(emb_meta, f, indent=4)
+    if is_rank_zero:
+        with open(os.path.join(save_dir_sparse, "sparse_features.json"), "w") as f:
+            json.dump(feat_meta, f, indent=4)
 
     # Extract Dense Model
     logger.info("exporting dense model...")
@@ -1367,12 +1378,12 @@ def _merge_sharded_embedding_json(
     """Merge sharded embedding json files into one."""
     merged_json = {}
     for emb_json in emb_json_files:
-        for feat_name, info in emb_json.items():
-            if feat_name not in merged_json:
-                merged_json[feat_name] = info
+        for emb_name, info in emb_json.items():
+            if emb_name not in merged_json:
+                merged_json[emb_name] = info
             else:
-                merged_json[feat_name]["memory"] += info["memory"]
-                merged_json[feat_name]["shape"][0] += info["shape"][0]
+                merged_json[emb_name]["memory"] += info["memory"]
+                merged_json[emb_name]["shape"][0] += info["shape"][0]
 
     return merged_json
 
@@ -1416,28 +1427,36 @@ def _get_sparse_embedding_tensor(
     """Get Embedding Tensors for sparse part."""
     emb_name_to_emb_dim = dict()
     feat_name_to_pooling = dict()
+
+    feat_name_impl_to_emb_name = dict()
+    emb_name_to_feat_name_impl = dict()
+
     for emb_info in embedding_infos:
-        emb_name_impl = emb_info.name + "__ec"
-        emb_name_to_emb_dim[emb_name_impl] = emb_info.embedding_dim
-        feat_name = (
-            emb_info.name[:-4] if emb_info.name.endswith("_emb") else emb_info.name
-        )
-        feat_name_impl = feat_name + "__ec"
-        if hasattr(emb_info, "pooling"):
-            feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[-1]
-        else:
-            feat_name_to_pooling[feat_name_impl] = "NONE"
+        emb_name_to_emb_dim[emb_info.name] = emb_info.embedding_dim
+        emb_name_to_feat_name_impl[emb_info.name] = []
+        for feat_name in emb_info.feature_names:
+            feat_name_impl = feat_name + "__ec"
+            emb_name_to_feat_name_impl[emb_info.name].append(feat_name_impl)
+            feat_name_impl_to_emb_name[feat_name_impl] = emb_info.name
+            if hasattr(emb_info, "pooling"):
+                feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[
+                    -1
+                ]
+            else:
+                feat_name_to_pooling[feat_name_impl] = "NONE"
     for emb_info in embedding_bag_info:
-        emb_name_impl = emb_info.name + "__ebc"
-        emb_name_to_emb_dim[emb_name_impl] = emb_info.embedding_dim
-        feat_name = (
-            emb_info.name[:-4] if emb_info.name.endswith("_emb") else emb_info.name
-        )
-        feat_name_impl = feat_name + "__ebc"
-        if hasattr(emb_info, "pooling"):
-            feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[-1]
-        else:
-            feat_name_to_pooling[feat_name_impl] = "NONE"
+        emb_name_to_emb_dim[emb_info.name] = emb_info.embedding_dim
+        emb_name_to_feat_name_impl[emb_info.name] = []
+        for feat_name in emb_info.feature_names:
+            feat_name_impl = feat_name + "__ebc"
+            emb_name_to_feat_name_impl[emb_info.name].append(feat_name_impl)
+            feat_name_impl_to_emb_name[feat_name_impl] = emb_info.name
+            if hasattr(emb_info, "pooling"):
+                feat_name_to_pooling[feat_name_impl] = str(emb_info.pooling).split(".")[
+                    -1
+                ]
+            else:
+                feat_name_to_pooling[feat_name_impl] = "NONE"
 
     def _remove_prefix(src: str, prefix: str = "torch.") -> str:
         if src.startswith(prefix):
@@ -1445,21 +1464,17 @@ def _get_sparse_embedding_tensor(
         return src
 
     out = {}
-    shard_offsets = {}
+    # shard_offsets = {}
     value_name_to_key = {}
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     for name, values in model.state_dict().items():
         emb_name = name.split(".")[-2]
-        emb_impl_type = name.split(".")[2]  # 'emb_impls' or 'seq_emb_impls'
-        feat_name = emb_name[:-4] if emb_name.endswith("_emb") else emb_name
-        feat_name_impl = (
-            feat_name + "__ebc" if emb_impl_type == "emb_impls" else feat_name + "__ec"
-        )
-        emb_name_impl = (
-            emb_name + "__ebc" if emb_impl_type == "emb_impls" else emb_name + "__ec"
-        )
-        emb_dim = emb_name_to_emb_dim[emb_name_impl]
+        # emb_impl_type = name.split(".")[2]  # 'emb_impls' or 'seq_emb_impls'
+
+        # feat_name_impl_list = emb_name_to_feat_name_impl.get(emb_name, [])
+
+        emb_dim = emb_name_to_emb_dim[emb_name]
         if isinstance(values, DTensor):
             raise ValueError("DTensors are not considered yet.")
         elif isinstance(values, ShardedTensor):
@@ -1475,14 +1490,14 @@ def _get_sparse_embedding_tensor(
                         local_tensor = values.local_tensor().cpu().numpy()
                         if list(local_tensor.shape)[-1] == emb_dim:
                             # dynamicemb may have a dummy tensor in state_dict, skip it.
-                            out[feat_name_impl] = local_tensor
+                            out[emb_name] = local_tensor
                             value_name_to_key[feat_name_impl] = None
-                            shard_offsets[feat_name_impl] = shards_meta.shard_offsets
+                            # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
         elif list(values.shape)[-1] == emb_dim:
             # dynamicemb may have a dummy tensor in state_dict, skip it.
-            out[feat_name_impl] = values
+            out[emb_name] = values
             value_name_to_key[feat_name_impl] = None
-            shard_offsets[feat_name_impl] = shards_meta.shard_offsets
+            # shard_offsets[feat_name_impl] = shards_meta.shard_offsets
 
     dynamicemb_path = os.path.join(checkpoint_path, "dynamicemb")
     if os.path.exists(dynamicemb_path):
@@ -1525,29 +1540,37 @@ def _get_sparse_embedding_tensor(
 
     # TODO(hongsheng.jhs): support mczch
 
-    meta = {}
-    for name, key_name in value_name_to_key.items():
-        values = out[name]
+    emb_meta = {}
+    for emb_name, feat_name_impl_list in emb_name_to_feat_name_impl.items():
+        values = out[emb_name]
         dimension = list(values.shape)[-1]
         dtype = _remove_prefix(str(values.dtype))
         memory: int = int(values.nbytes)
         shape = list(values.shape)
         t_meta = {
-            "name": name,
+            "feat_name_impl": feat_name_impl_list,
             "dense": False,
             "dimension": dimension,
             "dtype": dtype,
             "memory": memory,
             "shape": shape,
-            "shard_offsets": shard_offsets[name],
-            "pooling": feat_name_to_pooling[name],
+            # "shard_offsets": shard_offsets[name],
+            # "pooling": feat_name_to_pooling[name],
         }
-        if key_name is not None:
-            t_meta["hashmap_value"] = name
-            t_meta["hashmap_key"] = key_name
-            t_meta["hashmap_key_dtype"] = "int64"
-            t_meta["is_hashmap"] = True
-        else:
-            t_meta["is_hashmap"] = False
-        meta[name] = t_meta
-    return out, meta
+        # if key_name is not None:
+        #     t_meta["hashmap_value"] = name
+        #     t_meta["hashmap_key"] = key_name
+        #     t_meta["hashmap_key_dtype"] = "int64"
+        #     t_meta["is_hashmap"] = True
+        # else:
+        #     t_meta["is_hashmap"] = False
+        emb_meta[emb_name] = t_meta
+
+    feat_meta = {}
+    for feat_name_impl, emb_name in feat_name_impl_to_emb_name.items():
+        t_meta = {
+            "embedding_name": emb_name,
+            "pooling": feat_name_to_pooling[feat_name_impl],
+        }
+        feat_meta[feat_name_impl] = t_meta
+    return out, emb_meta, feat_meta

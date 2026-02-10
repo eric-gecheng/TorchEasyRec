@@ -835,25 +835,29 @@ class EmbeddingGroupImpl(nn.Module):
         # do user-side embedding input-tile
         if self.has_sparse_user:
             keyed_tensor_user = self.ebc_user(sparse_feature_user)
+            fx_mark_keyed_tensor(self._all_group_str + "__ebc_user", keyed_tensor_user)
             values_tile = keyed_tensor_user.values().tile(tile_size, 1)
             kt = KeyedTensor(
                 keys=keyed_tensor_user.keys(),
                 length_per_key=keyed_tensor_user.length_per_key(),
                 values=values_tile,
             )
-            fx_mark_keyed_tensor(self._all_group_str + "__ebc_user", kt)
+            # fx_mark_keyed_tensor(self._all_group_str + "__ebc_user", kt)
             kts.append(kt)
 
         # do user-side mc embedding input-tile
         if self.has_mc_sparse_user:
             keyed_tensor_user = self.mc_ebc_user(sparse_feature_user)[0]
+            fx_mark_keyed_tensor(
+                self._all_group_str + "__mc_ebc_user", keyed_tensor_user
+            )
             values_tile = keyed_tensor_user.values().tile(tile_size, 1)
             kt = KeyedTensor(
                 keys=keyed_tensor_user.keys(),
                 length_per_key=keyed_tensor_user.length_per_key(),
                 values=values_tile,
             )
-            fx_mark_keyed_tensor(self._all_group_str + "__mc_ebc_user", kt)
+            # fx_mark_keyed_tensor(self._all_group_str + "__mc_ebc_user", kt)
             kts.append(kt)
 
         if self.has_dense:
@@ -1093,6 +1097,14 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 list(emb_configs.values()), device=device
             )
 
+        self.ec_dict_features = OrderedDict()
+        for k, ec in self.ec_dict.items():
+            feat_list = []
+            for emb_config in ec._embedding_configs:
+                for feature_name in emb_config.feature_names:
+                    feat_list.append(feature_name)
+            self.ec_dict_features[k] = feat_list
+
         self.mc_ec_dict = nn.ModuleDict()
         for k, emb_configs in dim_to_mc_emb_configs.items():
             self.mc_ec_dict[str(k)] = ManagedCollisionEmbeddingCollection(
@@ -1108,6 +1120,13 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 self.ec_dict_user[str(k)] = EmbeddingCollection(
                     list(emb_configs.values()), device=device
                 )
+            self.ec_dict_features_user = OrderedDict()
+            for k, ec in self.ec_dict_user.items():
+                feat_list = []
+                for emb_config in ec._embedding_configs:
+                    for feature_name in emb_config.feature_names:
+                        feat_list.append(feature_name)
+                self.ec_dict_features_user[k] = feat_list
 
             self.mc_ec_dict_user = nn.ModuleDict()
             for k, emb_configs in dim_to_mc_emb_configs_user.items():
@@ -1168,17 +1187,16 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         dense_t_dict: Dict[str, torch.Tensor] = {}
 
         if self.has_sparse:
-            for ec in self.ec_dict.values():
+            for feature_keys, ec in zip(
+                self.ec_dict_features.values(), self.ec_dict.values()
+            ):
                 d_jt = ec(sparse_feature)
                 new_d_jt = {}
-                for k in self.seq_sparse_keys:
-                    val = d_jt[k]
-                    fx_mark_seq_ec_jt(f"{k}", val)
-                    new_d_jt[k] = val
-                for k in self.query_sparse_keys:
-                    val = d_jt[k]
-                    fx_mark_seq_ec_jt(f"{k}", val)
-                    new_d_jt[k] = val
+                for k in feature_keys:
+                    if k in self.seq_sparse_keys or k in self.query_sparse_keys:
+                        val = d_jt[k]
+                        fx_mark_seq_ec_jt(f"{k}", val)
+                        new_d_jt[k] = val
                 sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mc_sparse:
@@ -1189,17 +1207,19 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             seq_mulval_length_jt_dict_list.append(sequence_mulval_lengths.to_dict())
 
         if self.has_sparse_user:
-            for ec in self.ec_dict_user.values():
+            for feature_keys, ec in zip(
+                self.ec_dict_features_user.values(), self.ec_dict_user.values()
+            ):
                 d_jt = ec(sparse_feature_user)
                 new_d_jt = {}
-                for k in self.seq_sparse_keys_user:
-                    val = d_jt[k]
-                    fx_mark_seq_ec_jt(f"{k}", val)
-                    new_d_jt[k] = val
-                for k in self.query_sparse_keys_user:
-                    val = d_jt[k]
-                    fx_mark_seq_ec_jt(f"{k}", val)
-                    new_d_jt[k] = val
+                for k in feature_keys:
+                    if (
+                        k in self.seq_sparse_keys_user
+                        or k in self.query_sparse_keys_user
+                    ):
+                        val = d_jt[k]
+                        fx_mark_seq_ec_jt(f"{k}", val)
+                        new_d_jt[k] = val
                 sparse_jt_dict_list.append(new_d_jt)
 
         if self.has_mc_sparse_user:
