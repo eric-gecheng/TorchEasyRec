@@ -975,6 +975,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
         self._group_total_dim = dict()
         self._group_output_dims = dict()
         self._group_to_is_jagged = dict()
+        self._group_to_use_input_tile_3_online = dict()
         self._group_to_sequence_length = OrderedDict()
 
         feat_to_group_to_emb_name = defaultdict(dict)
@@ -1017,6 +1018,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
             feature_names = list(feature_group.feature_names)
             shared_query = []
             shared_sequence = []
+            sequence_length_sources = set()
             group_sequence_length = None
 
             for name in feature_names:
@@ -1108,6 +1110,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     shared_sequence.append(shared_info)
                     sequence_dim += output_dim
                     sequence_dims.append(output_dim)
+                    sequence_length_source = (
+                        feature.sequence_name if feature.is_grouped_sequence else name
+                    )
+                    sequence_length_sources.add(sequence_length_source)
                     group_sequence_length = feature.sequence_length
                 else:
                     shared_query.append(shared_info)
@@ -1117,6 +1123,12 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
             self._group_to_shared_query[group_name] = shared_query
             self._group_to_shared_sequence[group_name] = shared_sequence
+            # INPUT_TILE_3_ONLINE uses JaggedTensor.values() for user sequences.
+            # That is only safe to concat when all sequence features share one
+            # length source, e.g. different attributes of the same SequenceFeature.
+            self._group_to_use_input_tile_3_online[group_name] = (
+                len(sequence_length_sources) <= 1
+            )
             self._group_to_sequence_length[group_name] = group_sequence_length
             self._group_total_dim[f"{group_name}.query"] = query_dim
             self._group_total_dim[f"{group_name}.sequence"] = sequence_dim
@@ -1311,6 +1323,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
 
         results = {}
         sparse_query_cache: Dict[str, torch.Tensor] = {}
+        input_tile_3_online = int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1
         for group_name, v in self._group_to_shared_query.items():
             query_t_list = []
             query_t_keys = []
@@ -1368,7 +1381,9 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     results[f"{group_name}.sequence_length"] = sequence_length
 
                 if (
-                    int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1 and info.is_user
+                    input_tile_3_online
+                    and info.is_user
+                    and self._group_to_use_input_tile_3_online[group_name]
                 ) or self._group_to_is_jagged[group_name]:
                     seq_t = jt.values()
                 else:

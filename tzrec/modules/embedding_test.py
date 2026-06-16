@@ -189,6 +189,7 @@ class _EGScriptWrapper(nn.Module):
 class EmbeddingGroupTest(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("INPUT_TILE", None)
+        os.environ.pop("INPUT_TILE_3_ONLINE", None)
 
     @parameterized.expand(
         [
@@ -1105,6 +1106,53 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["buy.query"].size(), (2, 17))
         self.assertEqual(result["buy.sequence"].size(), (2, 2, 17))
         self.assertEqual(result["buy.sequence_length"].size(), (2,))
+
+    @parameterized.expand(
+        [
+            [TestGraphType.NORMAL],
+            [TestGraphType.FX_TRACE],
+            [TestGraphType.JIT_SCRIPT],
+        ]
+    )
+    def test_sequence_embedding_group_input_tile_3_online_mixed_group_fallback(
+        self, graph_type
+    ) -> None:
+        os.environ["INPUT_TILE"] = "3"
+        os.environ["INPUT_TILE_3_ONLINE"] = "1"
+        features = _create_test_sequence_features()
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="mixed",
+                feature_names=["click_seq__cat_a", "buy_seq__cat_a"],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+        ]
+        embedding_group = SequenceEmbeddingGroupImpl(
+            features, feature_groups, device=torch.device("cpu")
+        )
+        self.assertFalse(embedding_group._group_to_use_input_tile_3_online["mixed"])
+
+        embedding_group = create_test_module(embedding_group, graph_type)
+
+        sparse_feature_user = KeyedJaggedTensor.from_lengths_sync(
+            keys=["click_seq__cat_a", "buy_seq__cat_a"],
+            values=torch.tensor(list(range(5))),
+            lengths=torch.tensor([3, 2]),
+        )
+        result = embedding_group(
+            EMPTY_KJT,
+            KeyedTensor.from_tensor_list(
+                keys=["int_a"], tensors=[torch.tensor([[0.2], [0.3]])]
+            ),
+            {},
+            EMPTY_KJT,
+            sparse_feature_user,
+            EMPTY_KJT,
+            2,
+        )
+
+        self.assertEqual(result["mixed.sequence"].size(), (2, 3, 32))
+        self.assertEqual(result["mixed.sequence_length"].size(), (2,))
 
 
 if __name__ == "__main__":
